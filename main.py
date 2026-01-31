@@ -5,7 +5,7 @@ from sqlalchemy import func
 import random
 from config import config
 from database import Session
-from models import Word, User
+from models import Word, User, UserWord
 
 
 storage = StateMemoryStorage()
@@ -51,10 +51,21 @@ def new_user(message):
         return f"Пользователь {message.from_user.username} в игре!"
 
 
-def create_words():
+def create_words(message):
     with Session() as session:
+        user = session.query(User).filter_by(tg_id=message.from_user.id).first()
+        if not user:
+            print(f"Юзер {message.from_user.username} вне игры!")
+            return []
         word_pairs = session.query(Word).order_by(func.random()).limit(4).all()
-        pairs = [(row.original, row.translation, row.word_id) for row in word_pairs]
+        pairs = [(w.original, w.translation, w.word_id) for w in word_pairs]
+        for _, _, index in pairs:
+            stmn = session.query(UserWord).where(UserWord.word_id == index).first()
+            if stmn:
+                stmn.score += 1
+            else:
+                session.add(UserWord(user_id=user.user_id, word_id=index, score=1))
+        session.commit()
     return pairs
 
 
@@ -69,12 +80,10 @@ def show_hint(*lines):
 @bot.message_handler(func=lambda message: message.text == "Тренька!")
 def train(message):
     new_user(message)
-    pairs = create_words()
+    pairs = create_words(message)
     selected_pair = random.choice(pairs)
-
     markup = types.ReplyKeyboardMarkup(row_width=2)
 
-    global buttons
     buttons = []
     target_btn = types.KeyboardButton(selected_pair[0])
     buttons.append(target_btn)
@@ -89,13 +98,16 @@ def train(message):
     buttons.extend([next_btn, add_word_btn, delete_word_btn])
     markup.add(*buttons)
 
-    greeting = f"Выбери перевод слова:\n🇷🇺 {selected_pair[1]}"
-    bot.send_message(message.chat.id, greeting, reply_markup=markup)
     bot.set_state(message.from_user.id, StateWords.choose_word, message.chat.id)
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         data["choose_word"] = selected_pair[0]
         data["translate_word"] = selected_pair[1]
-        data["seen_words"] = [idx[2] for idx in pairs]
+        data["buttons"] = buttons  # Сохраняем кнопки в состоянии
+    print(
+        f"show_next_word: choose_word='{data['choose_word']}', translate_word='{data['translate_word']}'"
+    )
+    greeting = f"Тогда выбери перевод слова:\n🇷🇺 {selected_pair[1]}"
+    bot.send_message(message.chat.id, greeting, reply_markup=markup)
 
 
 @bot.message_handler(func=lambda message: message.text == Command.NEXT)
@@ -158,24 +170,47 @@ def get_add_rus_word(message):
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def message_reply(message):
     text = message.text
-    markup = types.ReplyKeyboardMarkup(row_width=2)
+    if text in [Command.NEXT, Command.ADD_WORD, Command.DELETE_WORD, "Тренька!"]:
+        return
+    
+    # Получаем данные из состояния и сохраняем значения
+    choose_word = None
+    translate_word = None
+    buttons = []
+    is_correct = False
+    
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        choose_word = data["choose_word"]
+        choose_word = data.get("choose_word")
+        translate_word = data.get("translate_word")
+        buttons = data.get("buttons", [])
+        
         if text == choose_word:
+            # Правильный ответ
+            print(f"Правильный ответ! text='{text}', choose_word='{choose_word}'")
             hint = show_target(data)
             hint_text = ["Отлично!❤", hint]
             hint = show_hint(*hint_text)
+            bot.send_message(message.chat.id, hint)
+            is_correct = True
         else:
-            for btn in buttons:
-                if btn.text == text:
-                    btn.text = text + " ❌"
-                    break
+            # Неправильный ответ
             hint = show_hint(
                 "Допущена ошибка!",
-                f"Попробуй ещё раз - 🇷🇺{data['translate_word']}",
+                f"Попробуй ещё раз - 🇷🇺{translate_word}",
             )
-    markup.add(*buttons)
-    bot.send_message(message.chat.id, hint, reply_markup=markup)
+            markup = types.ReplyKeyboardMarkup(row_width=2)
+            if buttons:
+                markup.add(*buttons)
+            bot.send_message(message.chat.id, hint, reply_markup=markup)
+            return
+    
+    # После закрытия контекста retrieve_data обновляем состояние
+    if not choose_word:
+        train(message)
+    elif is_correct:
+        # Очищаем старое состояние перед генерацией нового слова
+        bot.delete_state(message.from_user.id, message.chat.id)
+        train(message)
 
 
 if __name__ == "__main__":

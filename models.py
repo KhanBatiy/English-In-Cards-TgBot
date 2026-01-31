@@ -17,7 +17,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
 
-    user_id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String, nullable=False)
     tg_id = Column(Integer, nullable=False, unique=True)
     created_at = Column(TIMESTAMP, default=datetime.now)
