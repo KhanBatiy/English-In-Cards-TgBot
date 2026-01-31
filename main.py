@@ -1,0 +1,183 @@
+from telebot import TeleBot, types, custom_filters
+from telebot.storage import StateMemoryStorage
+from telebot.states import State, StatesGroup
+from sqlalchemy import func
+import random
+from config import config
+from database import Session
+from models import Word, User
+
+
+storage = StateMemoryStorage()
+bot = TeleBot(config.BOT_TOKEN, state_storage=storage)
+
+
+class StateWords(StatesGroup):
+    choose_word = State()
+    delete_word = State()
+    translate_word = State()
+    add_eng_word = State()
+    add_rus_word = State()
+
+
+bot.add_custom_filter(custom_filters.StateFilter(bot))
+
+
+class Command:
+    ADD_WORD = "Добавить слово ➕"
+    DELETE_WORD = "Удалить слово🔙"
+    NEXT = "Дальше ⏭"
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("Тренька!"))
+    bot.send_message(
+        message.chat.id,
+        f"Привет {message.from_user.username}👋 Давай попрактикуемся в английском языке. "
+        "Нажми на кнопку 'Тренька!'",
+        reply_markup=markup,
+    )
+
+
+def new_user(message):
+    with Session() as session:
+        if session.query(User).filter_by(tg_id=message.from_user.id).first() is None:
+            session.add(
+                User(tg_id=message.from_user.id, username=message.from_user.username)
+            )
+        session.commit()
+        return f"Пользователь {message.from_user.username} в игре!"
+
+
+def create_words():
+    with Session() as session:
+        word_pairs = session.query(Word).order_by(func.random()).limit(4).all()
+        pairs = [(row.original, row.translation, row.word_id) for row in word_pairs]
+    return pairs
+
+
+def show_target(data):
+    return f"{data['choose_word']} -> {data['translate_word']}"
+
+
+def show_hint(*lines):
+    return "\n".join(lines)
+
+
+@bot.message_handler(func=lambda message: message.text == "Тренька!")
+def train(message):
+    new_user(message)
+    pairs = create_words()
+    selected_pair = random.choice(pairs)
+
+    markup = types.ReplyKeyboardMarkup(row_width=2)
+
+    global buttons
+    buttons = []
+    target_btn = types.KeyboardButton(selected_pair[0])
+    buttons.append(target_btn)
+    others_btn = [
+        types.KeyboardButton(row[0]) for row in pairs if row[0] != selected_pair[0]
+    ]
+    buttons.extend(others_btn)
+    random.shuffle(buttons)
+    next_btn = types.KeyboardButton(Command.NEXT)
+    add_word_btn = types.KeyboardButton(Command.ADD_WORD)
+    delete_word_btn = types.KeyboardButton(Command.DELETE_WORD)
+    buttons.extend([next_btn, add_word_btn, delete_word_btn])
+    markup.add(*buttons)
+
+    greeting = f"Выбери перевод слова:\n🇷🇺 {selected_pair[1]}"
+    bot.send_message(message.chat.id, greeting, reply_markup=markup)
+    bot.set_state(message.from_user.id, StateWords.choose_word, message.chat.id)
+    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+        data["choose_word"] = selected_pair[0]
+        data["translate_word"] = selected_pair[1]
+        data["seen_words"] = [idx[2] for idx in pairs]
+
+
+@bot.message_handler(func=lambda message: message.text == Command.NEXT)
+def next_cards(message):
+    train(message)
+
+
+@bot.message_handler(func=lambda message: message.text == Command.DELETE_WORD)
+def delete_word(message):
+    bot.send_message(message.chat.id, "Введите слово на английском для удаления:")
+    bot.set_state(message.from_user.id, StateWords.delete_word, message.chat.id)
+
+
+@bot.message_handler(state=StateWords.delete_word)
+def input_delete_word(message):
+    add_eng_word = message.text
+
+    with Session() as session:
+        word = session.query(Word).filter_by(original=add_eng_word).first()
+        if word:
+            session.delete(word)
+            session.commit()
+            bot.send_message(
+                message.chat.id, f"Слово '{add_eng_word}' успешно удалено!"
+            )
+        else:
+            bot.send_message(message.chat.id, "Слово не найдено.")
+
+    bot.delete_state(message.from_user.id, message.chat.id)
+    train(message)
+
+
+@bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
+def add_word(message):
+    bot.send_message(message.chat.id, "Введите английское слово:")
+    bot.set_state(message.from_user.id, StateWords.add_eng_word, message.chat.id)
+
+
+@bot.message_handler(state=StateWords.add_eng_word)
+def get_add_eng_word(message):
+    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+        data["add_eng_word"] = message.text
+    bot.send_message(message.chat.id, "Введите перевод слова:")
+    bot.set_state(message.from_user.id, StateWords.add_rus_word, message.chat.id)
+
+
+@bot.message_handler(state=StateWords.add_rus_word)
+def get_add_rus_word(message):
+    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+        data["add_rus_word"] = message.text
+        with Session() as session:
+            word = Word(original=data["add_eng_word"], translation=data["add_rus_word"])
+            session.add(word)
+            session.commit()
+    bot.send_message(message.chat.id, "Слово успешно добавлено!")
+    bot.delete_state(message.from_user.id, message.chat.id)
+    train(message)
+
+
+@bot.message_handler(func=lambda message: True, content_types=["text"])
+def message_reply(message):
+    text = message.text
+    markup = types.ReplyKeyboardMarkup(row_width=2)
+    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+        choose_word = data["choose_word"]
+        if text == choose_word:
+            hint = show_target(data)
+            hint_text = ["Отлично!❤", hint]
+            hint = show_hint(*hint_text)
+        else:
+            for btn in buttons:
+                if btn.text == text:
+                    btn.text = text + " ❌"
+                    break
+            hint = show_hint(
+                "Допущена ошибка!",
+                f"Попробуй ещё раз - 🇷🇺{data['translate_word']}",
+            )
+    markup.add(*buttons)
+    bot.send_message(message.chat.id, hint, reply_markup=markup)
+
+
+if __name__ == "__main__":
+    print("Бот запущен...")
+    bot.polling(none_stop=True, interval=0)
