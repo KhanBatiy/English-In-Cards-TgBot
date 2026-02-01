@@ -2,10 +2,12 @@ from telebot import TeleBot, types, custom_filters
 from telebot.storage import StateMemoryStorage
 from telebot.states import State, StatesGroup
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 import random
+
 from config import config
 from database import Session
-from models import Word, User, UserWord
+from models import Word, User, UserWord, LearningHistory
 
 
 storage = StateMemoryStorage()
@@ -43,12 +45,25 @@ def start(message):
 
 def new_user(message):
     with Session() as session:
-        if session.query(User).filter_by(tg_id=message.from_user.id).first() is None:
-            session.add(
-                User(tg_id=message.from_user.id, username=message.from_user.username)
+        user = session.query(User).filter_by(tg_id=message.from_user.id).first()
+        if user is None:
+            username = (
+                message.from_user.username
+                or message.from_user.first_name
+                or f"user_{message.from_user.id}"
             )
-        session.commit()
-        return f"Пользователь {message.from_user.username} в игре!"
+            new_user_obj = User(tg_id=message.from_user.id, username=username)
+            session.add(new_user_obj)
+            session.commit()
+            
+        if user:
+            username = (
+                user.username
+                or message.from_user.username
+                or message.from_user.first_name
+                or f"user_{message.from_user.id}"
+            )
+        return f"Юзер {username} в игре!"
 
 
 def create_words(message):
@@ -58,13 +73,24 @@ def create_words(message):
             print(f"Юзер {message.from_user.username} вне игры!")
             return []
         word_pairs = session.query(Word).order_by(func.random()).limit(4).all()
+        if not word_pairs:
+            return []
         pairs = [(w.original, w.translation, w.word_id) for w in word_pairs]
-        for _, _, index in pairs:
-            stmn = session.query(UserWord).where(UserWord.word_id == index).first()
+        for _, _, word_id in pairs:
+            if not word_id:
+                continue
+            word = session.query(Word).filter_by(word_id=word_id).first()
+            if not word:
+                continue
+            stmn = (
+                session.query(UserWord)
+                .filter_by(user_id=user.user_id, word_id=word_id)
+                .first()
+            )
             if stmn:
                 stmn.score += 1
             else:
-                session.add(UserWord(user_id=user.user_id, word_id=index, score=1))
+                session.add(UserWord(user_id=user.user_id, word_id=word_id, score=1))
         session.commit()
     return pairs
 
@@ -77,11 +103,62 @@ def show_hint(*lines):
     return "\n".join(lines)
 
 
+def update_learning_history(user_id, word_id, is_correct):
+    if not word_id:
+        return
+    
+    with Session() as session:
+        user = session.query(User).filter_by(tg_id=user_id).first()
+        if not user:
+            return
+        
+        word = session.query(Word).filter_by(word_id=word_id).first()
+        if not word:
+            return
+        
+        history = (
+            session.query(LearningHistory)
+            .filter_by(user_id=user.user_id, word_id=word_id)
+            .first()
+        )
+        
+        if history:
+            if is_correct:
+                history.correct_count += 1
+            else:
+                history.feil_count += 1
+        else:
+            if is_correct:
+                history = LearningHistory(
+                    user_id=user.user_id,
+                    word_id=word_id,
+                    correct_count=1,
+                    feil_count=0
+                )
+            else:
+                history = LearningHistory(
+                    user_id=user.user_id,
+                    word_id=word_id,
+                    correct_count=0,
+                    feil_count=1
+                )
+            session.add(history)
+        
+        session.commit()
+
+
 @bot.message_handler(func=lambda message: message.text == "Тренька!")
 def train(message):
     new_user(message)
     pairs = create_words(message)
+    if not pairs:
+        bot.send_message(message.chat.id, "Ошибка: не удалось получить слова для тренировки")
+        return
     selected_pair = random.choice(pairs)
+    if len(selected_pair) < 3:
+        bot.send_message(message.chat.id, "Ошибка: некорректные данные слова")
+        return
+
     markup = types.ReplyKeyboardMarkup(row_width=2)
 
     buttons = []
@@ -92,6 +169,7 @@ def train(message):
     ]
     buttons.extend(others_btn)
     random.shuffle(buttons)
+
     next_btn = types.KeyboardButton(Command.NEXT)
     add_word_btn = types.KeyboardButton(Command.ADD_WORD)
     delete_word_btn = types.KeyboardButton(Command.DELETE_WORD)
@@ -102,10 +180,10 @@ def train(message):
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         data["choose_word"] = selected_pair[0]
         data["translate_word"] = selected_pair[1]
-        data["buttons"] = buttons  # Сохраняем кнопки в состоянии
-    print(
-        f"show_next_word: choose_word='{data['choose_word']}', translate_word='{data['translate_word']}'"
-    )
+        data["word_id"] = selected_pair[2]
+        data["buttons"] = buttons
+        print(f"Сохранено в состояние: choose_word={selected_pair[0]}")
+
     greeting = f"Тогда выбери перевод слова:\n🇷🇺 {selected_pair[1]}"
     bot.send_message(message.chat.id, greeting, reply_markup=markup)
 
@@ -125,9 +203,14 @@ def delete_word(message):
 def input_delete_word(message):
     add_eng_word = message.text
 
+    bot.delete_state(message.from_user.id, message.chat.id)
+
     with Session() as session:
         word = session.query(Word).filter_by(original=add_eng_word).first()
         if word:
+            word_id = word.word_id
+            session.query(UserWord).filter_by(word_id=word_id).delete()
+            session.query(LearningHistory).filter_by(word_id=word_id).delete()
             session.delete(word)
             session.commit()
             bot.send_message(
@@ -136,8 +219,45 @@ def input_delete_word(message):
         else:
             bot.send_message(message.chat.id, "Слово не найдено.")
 
-    bot.delete_state(message.from_user.id, message.chat.id)
     train(message)
+
+
+@bot.message_handler(commands=["stats"])
+def show_stats(message):
+    with Session() as session:
+        stats = (
+            session.query(
+                User.username,
+                func.sum(LearningHistory.correct_count).label("total_correct"),
+                func.sum(LearningHistory.feil_count).label("total_errors")
+            )
+            .join(LearningHistory, User.user_id == LearningHistory.user_id)
+            .group_by(User.user_id, User.username)
+            .having(func.sum(LearningHistory.correct_count) > 0)
+            .order_by(func.sum(LearningHistory.correct_count).desc())
+            .limit(3)
+            .all()
+        )
+        
+        if not stats:
+            bot.send_message(
+                message.chat.id,
+                "Статистика пока пуста. Начните тренироваться, чтобы попасть в рейтинг!"
+            )
+            return
+        
+        message_text = "ЛИДЕРЫ:\n\n"
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for idx, (username, total_correct, total_errors) in enumerate(stats, 1):
+            medal = medals[idx - 1]
+            message_text += (
+                f"{medal} {username}\n"
+                f"   Правильных: {total_correct or 0}\n"
+                f"   Ошибок: {total_errors or 0}\n\n"
+            )
+        
+        bot.send_message(message.chat.id, message_text)
 
 
 @bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
@@ -172,28 +292,27 @@ def message_reply(message):
     text = message.text
     if text in [Command.NEXT, Command.ADD_WORD, Command.DELETE_WORD, "Тренька!"]:
         return
-    
-    # Получаем данные из состояния и сохраняем значения
     choose_word = None
     translate_word = None
+    word_id = None
     buttons = []
-    is_correct = False
     
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         choose_word = data.get("choose_word")
         translate_word = data.get("translate_word")
+        word_id = data.get("word_id")
         buttons = data.get("buttons", [])
         
         if text == choose_word:
-            # Правильный ответ
-            print(f"Правильный ответ! text='{text}', choose_word='{choose_word}'")
+            if word_id:
+                update_learning_history(message.from_user.id, word_id, is_correct=True)
             hint = show_target(data)
             hint_text = ["Отлично!❤", hint]
             hint = show_hint(*hint_text)
             bot.send_message(message.chat.id, hint)
-            is_correct = True
         else:
-            # Неправильный ответ
+            if word_id:
+                update_learning_history(message.from_user.id, word_id, is_correct=False)
             hint = show_hint(
                 "Допущена ошибка!",
                 f"Попробуй ещё раз - 🇷🇺{translate_word}",
@@ -203,12 +322,9 @@ def message_reply(message):
                 markup.add(*buttons)
             bot.send_message(message.chat.id, hint, reply_markup=markup)
             return
-    
-    # После закрытия контекста retrieve_data обновляем состояние
     if not choose_word:
         train(message)
-    elif is_correct:
-        # Очищаем старое состояние перед генерацией нового слова
+    else:
         bot.delete_state(message.from_user.id, message.chat.id)
         train(message)
 

@@ -71,9 +71,8 @@ class LearningHistory(Base):
     word_id = Column(
         Integer, ForeignKey("words.word_id", ondelete="CASCADE"), nullable=False
     )
-    answer = Column(String, nullable=False)
-    is_correct = Column(Boolean, nullable=False)
-    options = Column(String, nullable=False)
+    correct_count = Column(Integer, nullable=False, default=0)
+    feil_count = Column(Integer, nullable=False, default=0)
 
     user = relationship("User", backref="learning_history", cascade="all, delete")
     word = relationship("Word", backref="learning_history", cascade="all, delete")
