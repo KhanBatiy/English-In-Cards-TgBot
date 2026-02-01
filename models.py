@@ -1,12 +1,5 @@
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    ForeignKey,
-    TIMESTAMP,
-    Boolean,
-)
+from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
