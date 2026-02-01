@@ -2,6 +2,7 @@ from telebot import TeleBot, types, custom_filters
 from telebot.storage import StateMemoryStorage
 from telebot.states import State, StatesGroup
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 import random
 
 from config import config
@@ -54,7 +55,7 @@ def new_user(message):
             new_user_obj = User(tg_id=message.from_user.id, username=username)
             session.add(new_user_obj)
             session.commit()
-
+            
         if user:
             username = (
                 user.username
@@ -105,22 +106,22 @@ def show_hint(*lines):
 def update_learning_history(user_id, word_id, is_correct):
     if not word_id:
         return
-
+    
     with Session() as session:
         user = session.query(User).filter_by(tg_id=user_id).first()
         if not user:
             return
-
+        
         word = session.query(Word).filter_by(word_id=word_id).first()
         if not word:
             return
-
+        
         history = (
             session.query(LearningHistory)
             .filter_by(user_id=user.user_id, word_id=word_id)
             .first()
         )
-
+        
         if history:
             if is_correct:
                 history.correct_count += 1
@@ -129,14 +130,20 @@ def update_learning_history(user_id, word_id, is_correct):
         else:
             if is_correct:
                 history = LearningHistory(
-                    user_id=user.user_id, word_id=word_id, correct_count=1, feil_count=0
+                    user_id=user.user_id,
+                    word_id=word_id,
+                    correct_count=1,
+                    feil_count=0
                 )
             else:
                 history = LearningHistory(
-                    user_id=user.user_id, word_id=word_id, correct_count=0, feil_count=1
+                    user_id=user.user_id,
+                    word_id=word_id,
+                    correct_count=0,
+                    feil_count=1
                 )
             session.add(history)
-
+        
         session.commit()
 
 
@@ -145,9 +152,7 @@ def train(message):
     new_user(message)
     pairs = create_words(message)
     if not pairs:
-        bot.send_message(
-            message.chat.id, "Ошибка: не удалось получить слова для тренировки"
-        )
+        bot.send_message(message.chat.id, "Ошибка: не удалось получить слова для тренировки")
         return
     selected_pair = random.choice(pairs)
     if len(selected_pair) < 3:
@@ -224,7 +229,7 @@ def show_stats(message):
             session.query(
                 User.username,
                 func.sum(LearningHistory.correct_count).label("total_correct"),
-                func.sum(LearningHistory.feil_count).label("total_errors"),
+                func.sum(LearningHistory.feil_count).label("total_errors")
             )
             .join(LearningHistory, User.user_id == LearningHistory.user_id)
             .group_by(User.user_id, User.username)
@@ -233,17 +238,17 @@ def show_stats(message):
             .limit(3)
             .all()
         )
-
+        
         if not stats:
             bot.send_message(
                 message.chat.id,
-                "Статистика пока пуста. Начните тренироваться, чтобы попасть в рейтинг!",
+                "Статистика пока пуста. Начните тренироваться, чтобы попасть в рейтинг!"
             )
             return
-
+        
         message_text = "ЛИДЕРЫ:\n\n"
         medals = ["🥇", "🥈", "🥉"]
-
+        
         for idx, (username, total_correct, total_errors) in enumerate(stats, 1):
             medal = medals[idx - 1]
             message_text += (
@@ -251,7 +256,7 @@ def show_stats(message):
                 f"   Правильных: {total_correct or 0}\n"
                 f"   Ошибок: {total_errors or 0}\n\n"
             )
-
+        
         bot.send_message(message.chat.id, message_text)
 
 
@@ -291,13 +296,13 @@ def message_reply(message):
     translate_word = None
     word_id = None
     buttons = []
-
+    
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         choose_word = data.get("choose_word")
         translate_word = data.get("translate_word")
         word_id = data.get("word_id")
         buttons = data.get("buttons", [])
-
+        
         if text == choose_word:
             if word_id:
                 update_learning_history(message.from_user.id, word_id, is_correct=True)
