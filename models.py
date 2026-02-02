@@ -1,5 +1,5 @@
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP
+from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP, BigInteger
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -10,9 +10,9 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
 
-    user_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, primary_key=True)
     username = Column(String, nullable=False)
-    tg_id = Column(Integer, nullable=False, unique=True)
+    tg_id = Column(BigInteger, nullable=False, unique=True)
     created_at = Column(TIMESTAMP, default=datetime.now)
 
     def __repr__(self):
@@ -49,7 +49,7 @@ class UserWord(Base):
     word = relationship("Word", backref="user_words", cascade="all, delete")
 
     def __repr__(self):
-        return f"UserWord(id={self.id}, user_id={self.user_id}, \
+        return f"UserWord(id={self.user_word_id}, user_id={self.user_id}, \
             word_id={self.word_id}, added_at={self.added_at}, \
             removed_at={self.removed_at}, score={self.score})"
 
@@ -71,6 +71,8 @@ class LearningHistory(Base):
     word = relationship("Word", backref="learning_history", cascade="all, delete")
 
     def __repr__(self):
-        return f"LearningHistory(id={self.id}, user_id={self.user_id}, \
-                word_id={self.word_id}, answer={self.answer}, \
-                is_correct={self.is_correct}, options={self.options})"
+        return (
+            f"LearningHistory(id={self.learning_history_id}, user_id={self.user_id}, \
+                word_id={self.word_id}, correct_count={self.correct_count}, \
+                feil_count={self.feil_count})"
+        )

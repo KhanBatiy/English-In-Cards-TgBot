@@ -53,9 +53,13 @@ def new_user(message):
             )
             new_user_obj = User(tg_id=message.from_user.id, username=username)
             session.add(new_user_obj)
-            session.commit()
-
-        if user:
+            try:
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"Ошибка при создании пользователя: {e}")
+                raise
+        else:
             username = (
                 user.username
                 or message.from_user.username
