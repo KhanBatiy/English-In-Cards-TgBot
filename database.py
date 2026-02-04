@@ -19,6 +19,9 @@ def drop_tables(engine):
 
 
 def populate_words():
+    """
+    Заполняет базу данных начальным набором слов
+    """
     with Session() as session:
         initial_words = [
             # Тело человека, здоровье
@@ -495,6 +498,8 @@ def populate_words():
             ("agile", "гибкая методология"),
             ("waterfall", "водопадная модель"),
         ]
+
+        # Добавляем слова в базу данных, избегая дубликатов
         for eng, rus in initial_words:
             existing = session.query(Word).filter_by(original=eng).first()
             if not existing:
