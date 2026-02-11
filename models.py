@@ -14,7 +14,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import (
     Column, Integer, String, ForeignKey, TIMESTAMP, BigInteger,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from datetime import datetime
 
 from validators import MAX_WORD_LENGTH
@@ -112,7 +112,11 @@ class LearningHistory(Base):
     seen_count = Column(Integer, nullable=False, default=0)
 
     user = relationship("User", backref="learning_history")
-    word = relationship("Word", backref="learning_history")
+    # passive_deletes=True: при удалении Word БД сама удалит записи (ON DELETE CASCADE)
+    word = relationship(
+        "Word",
+        backref=backref("learning_history", passive_deletes=True),
+    )
 
     def __repr__(self):
         return (

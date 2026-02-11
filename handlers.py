@@ -115,7 +115,6 @@ def train(message):
         data["translate_word"] = selected_pair[1]
         data["word_id"] = selected_pair[2]
         data["buttons"] = buttons
-        print(f"Сохранено в состояние: choose_word={selected_pair[0]}")
 
     greeting = f"Тогда выбери перевод слова:\n🇷🇺 {selected_pair[1]}"
     bot.send_message(message.chat.id, greeting, reply_markup=markup)
