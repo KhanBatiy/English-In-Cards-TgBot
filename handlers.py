@@ -1,10 +1,13 @@
+import logging
+import random
+
 from telebot import types
 from telebot.states import State, StatesGroup
 from sqlalchemy import func
-import random
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from default_db import Session
-from models import User, LearningHistory, Dictionary
+from models import User, LearningHistory, Dictionary, Word
 from bot_instance import bot
 from services import (
     create_words,
@@ -13,6 +16,9 @@ from services import (
     show_target,
     update_learning_history,
 )
+from validators import validate_english_word, validate_russian_text
+
+logger = logging.getLogger(__name__)
 
 
 class StateWords(StatesGroup):
@@ -45,11 +51,13 @@ def start(message):
     """
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("Тренька!"))
+    hello = (
+        f"Привет {message.from_user.username}👋 "
+        "Давай попрактикуемся в английском языке. "
+        "Нажми на кнопку 'Тренька!'"
+    )
     bot.send_message(
-        message.chat.id,
-        f"Привет {message.from_user.username}👋 Давай попрактикуемся в английском языке. "
-        "Нажми на кнопку 'Тренька!'",
-        reply_markup=markup,
+        message.chat.id, hello, reply_markup=markup,
     )
 
 
@@ -82,7 +90,9 @@ def train(message):
 
     # Добавляем остальные варианты
     others_btn = [
-        types.KeyboardButton(row[0]) for row in pairs if row[0] != selected_pair[0]
+        types.KeyboardButton(row[0])
+        for row in pairs
+        if row[0] != selected_pair[0]
     ]
     buttons.extend(others_btn)
     random.shuffle(buttons)
@@ -95,7 +105,11 @@ def train(message):
     markup.add(*buttons)
 
     # Устанавливаем состояние выбора слова
-    bot.set_state(message.from_user.id, StateWords.choose_word, message.chat.id)
+    bot.set_state(
+        message.from_user.id,
+        StateWords.choose_word,
+        message.chat.id,
+    )
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         data["choose_word"] = selected_pair[0]
         data["translate_word"] = selected_pair[1]
@@ -120,38 +134,72 @@ def delete_word(message):
     """
     Обработчик кнопки 'Удалить слово' - запрашивает слово для удаления
     """
-    bot.send_message(message.chat.id, "Введите слово на английском для удаления:")
-    bot.set_state(message.from_user.id, StateWords.delete_word, message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        "Введите слово на английском для удаления:",
+    )
+    bot.set_state(
+        message.from_user.id,
+        StateWords.delete_word,
+        message.chat.id,
+    )
 
 
 @bot.message_handler(state=StateWords.delete_word)
 def input_delete_word(message):
     """
-    Обработчик удаления слова из базы данных
+    Обработчик удаления слова из базы данных.
+    Удаляет слово из таблицы Word (для всех) или из Dictionary
+    (добавленные пользователем).
     """
-    eng_word = message.text
+    eng_word = (message.text or "").strip()
     tg_id = message.from_user.id
 
+    ok, err = validate_english_word(eng_word)
+    if not ok:
+        bot.send_message(message.chat.id, err)
+        train(message)
+        return
+
     try:
-        # Удаляем состояние пользователя
         bot.delete_state(message.from_user.id, message.chat.id)
 
-        # Удаляем слово из базы данных
         with Session() as session:
             user = session.query(User).filter(User.tg_id == tg_id).first()
             if not user:
                 bot.send_message(message.chat.id, "Пользователь не найден!")
                 return
-            word = (
-                session.query(Dictionary)
+
+            deleted = False
+
+            # Сначала ищем в таблице Word (без учёта регистра)
+            word_row = (
+                session.query(Word)
                 .filter(
-                    Dictionary.added_eng_word == eng_word,
-                    Dictionary.user_id == user.user_id,
+                    func.lower(Word.original) == eng_word.lower(),
                 )
                 .first()
             )
-            if word:
-                session.delete(word)
+            if word_row:
+                session.delete(word_row)
+                deleted = True
+
+            # Если не в Word — ищем в словаре пользователя
+            if not deleted:
+                dict_row = (
+                    session.query(Dictionary)
+                    .filter(
+                        func.lower(Dictionary.added_eng_word)
+                        == eng_word.lower(),
+                        Dictionary.user_id == user.user_id,
+                    )
+                    .first()
+                )
+                if dict_row:
+                    session.delete(dict_row)
+                    deleted = True
+
+            if deleted:
                 session.commit()
                 bot.send_message(
                     message.chat.id, f"Слово '{eng_word}' успешно удалено!"
@@ -160,9 +208,22 @@ def input_delete_word(message):
                 bot.send_message(message.chat.id, "Слово не найдено.")
 
         train(message)
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Ошибка БД при удалении слова (tg_id=%s, слово=%s): %s",
+            tg_id, eng_word, e,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка при удалении слова. Попробуйте позже.",
+        )
+        train(message)
     except Exception as e:
-        print(f"Ошибка в input_delete_word: {e}")
-        bot.send_message(message.chat.id, "Произошла ошибка при удалении слова.")
+        logger.exception("Неожиданная ошибка в input_delete_word: %s", e)
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка при удалении слова.",
+        )
         train(message)
 
 
@@ -177,13 +238,19 @@ def show_stats(message):
             stats = (
                 session.query(
                     User.username,
-                    func.sum(LearningHistory.correct_count).label("total_correct"),
-                    func.sum(LearningHistory.fail_count).label("total_errors"),
+                    func.sum(LearningHistory.correct_count).label(
+                        "total_correct",
+                    ),
+                    func.sum(LearningHistory.fail_count).label(
+                        "total_errors",
+                    ),
                 )
                 .join(LearningHistory, User.user_id == LearningHistory.user_id)
                 .group_by(User.user_id, User.username)
                 .having(func.sum(LearningHistory.correct_count) > 0)
-                .order_by(func.sum(LearningHistory.correct_count).desc())
+                .order_by(
+                    func.sum(LearningHistory.correct_count).desc(),
+                )
                 .limit(3)
                 .all()
             )
@@ -191,7 +258,8 @@ def show_stats(message):
             if not stats:
                 bot.send_message(
                     message.chat.id,
-                    "Статистика пока пуста. Начните тренироваться, чтобы попасть в рейтинг!",
+                    "Статистика пока пуста. "
+                    "Начните тренироваться, чтобы попасть в рейтинг!",
                 )
                 return
 
@@ -199,7 +267,9 @@ def show_stats(message):
             message_text = "ЛИДЕРЫ:\n\n"
             medals = ["🥇", "🥈", "🥉"]
 
-            for idx, (username, total_correct, total_errors) in enumerate(stats, 1):
+            for idx, (username, total_correct, total_errors) in enumerate(
+                stats, 1,
+            ):
                 medal = medals[idx - 1]
                 message_text += (
                     f"{medal} {username}\n"
@@ -208,9 +278,18 @@ def show_stats(message):
                 )
 
             bot.send_message(message.chat.id, message_text)
+    except SQLAlchemyError as e:
+        logger.exception("Ошибка БД в show_stats: %s", e)
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить статистику. Попробуйте позже.",
+        )
     except Exception as e:
-        print(f"Ошибка в show_stats: {e}")
-        bot.send_message(message.chat.id, "Произошла ошибка при получении статистики.")
+        logger.exception("Неожиданная ошибка в show_stats: %s", e)
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка при получении статистики.",
+        )
 
 
 @bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
@@ -219,7 +298,9 @@ def add_word(message):
     Обработчик кнопки 'Добавить слово' - запрашивает английское слово
     """
     bot.send_message(message.chat.id, "Введите английское слово:")
-    bot.set_state(message.from_user.id, StateWords.add_eng_word, message.chat.id)
+    bot.set_state(
+        message.from_user.id, StateWords.add_eng_word, message.chat.id,
+    )
 
 
 @bot.message_handler(state=StateWords.add_eng_word)
@@ -227,15 +308,31 @@ def get_add_eng_word(message):
     """
     Обработчик ввода английского слова
     """
+    text = (message.text or "").strip()
+    ok, err = validate_english_word(text)
+    if not ok:
+        bot.send_message(message.chat.id, err)
+        return
+
     try:
         with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-            data["add_eng_word"] = message.text
+            data["add_eng_word"] = text
             data["word_id"] = message.from_user.id
         bot.send_message(message.chat.id, "Введите перевод слова:")
-        bot.set_state(message.from_user.id, StateWords.add_rus_word, message.chat.id)
+        bot.set_state(
+            message.from_user.id,
+            StateWords.add_rus_word,
+            message.chat.id,
+        )
     except Exception as e:
-        print(f"Ошибка в get_add_eng_word: {e}")
-        bot.send_message(message.chat.id, "Произошла ошибка при сохранении слова.")
+        logger.exception(
+            "Ошибка при сохранении английского слова (tg_id=%s): %s",
+            message.from_user.id, e,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка при сохранении слова. Попробуйте снова.",
+        )
 
 
 @bot.message_handler(state=StateWords.add_rus_word)
@@ -243,9 +340,25 @@ def get_add_rus_word(message):
     """
     Обработчик ввода перевода слова - добавляет слово в базу данных
     """
+    rus_text = (message.text or "").strip()
+    ok, err = validate_russian_text(rus_text)
+    if not ok:
+        bot.send_message(message.chat.id, err)
+        return
+
     try:
         with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-            data["add_rus_word"] = message.text
+            eng_word = (data.get("add_eng_word") or "").strip()
+            ok_eng, err_eng = validate_english_word(eng_word)
+            if not ok_eng:
+                bot.send_message(
+                    message.chat.id,
+                    "Английское слово некорректно. "
+                    "Начните заново: кнопка «Добавить слово».",
+                )
+                bot.delete_state(message.from_user.id, message.chat.id)
+                return
+            data["add_rus_word"] = rus_text
 
             with Session() as session:
                 user = (
@@ -255,24 +368,48 @@ def get_add_rus_word(message):
                 )
                 if not user:
                     bot.send_message(
-                        message.chat.id, "Пользователь не найден в базе данных!"
+                        message.chat.id,
+                        "Пользователь не найден в базе данных!",
                     )
                     bot.delete_state(message.from_user.id, message.chat.id)
                     return
 
                 word = Dictionary(
                     user_id=user.user_id,
-                    added_eng_word=data["add_eng_word"],
-                    added_rus_word=data["add_rus_word"],
+                    added_eng_word=eng_word,
+                    added_rus_word=rus_text,
                 )
                 session.add(word)
                 session.commit()
         bot.send_message(message.chat.id, "Слово успешно добавлено!")
         bot.delete_state(message.from_user.id, message.chat.id)
         train(message)
+    except IntegrityError as e:
+        logger.warning(
+            "Ошибка целостности при добавлении слова (tg_id=%s): %s",
+            message.from_user.id, e,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Такое слово уже есть в словаре или ошибка данных.",
+        )
+        bot.delete_state(message.from_user.id, message.chat.id)
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Ошибка БД при добавлении слова (tg_id=%s): %s",
+            message.from_user.id, e,
+        )
+        bot.send_message(
+            message.chat.id,
+            "Не удалось добавить слово. Попробуйте позже.",
+        )
+        bot.delete_state(message.from_user.id, message.chat.id)
     except Exception as e:
-        print(f"Ошибка в get_add_rus_word: {e}")
-        bot.send_message(message.chat.id, "Произошла ошибка при добавлении слова.")
+        logger.exception("Неожиданная ошибка в get_add_rus_word: %s", e)
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка при добавлении слова.",
+        )
         bot.delete_state(message.from_user.id, message.chat.id)
 
 
@@ -283,7 +420,9 @@ def message_reply(message):
     """
     text = message.text
     # Игнорируем команды, которые обрабатываются отдельно
-    if text in [Command.NEXT, Command.ADD_WORD, Command.DELETE_WORD, "Тренька!"]:
+    if text in [
+        Command.NEXT, Command.ADD_WORD, Command.DELETE_WORD, "Тренька!",
+    ]:
         return
 
     # Инициализируем переменные для хранения данных о текущем слове
@@ -303,7 +442,9 @@ def message_reply(message):
     if text == choose_word:
         # Обработка правильного ответа
         if word_id:
-            update_learning_history(message.from_user.id, word_id, is_correct=True)
+            update_learning_history(
+                message.from_user.id, word_id, is_correct=True,
+            )
         hint = show_target(
             {"choose_word": choose_word, "translate_word": translate_word}
         )
@@ -313,7 +454,9 @@ def message_reply(message):
     else:
         # Обработка неправильного ответа
         if word_id:
-            update_learning_history(message.from_user.id, word_id, is_correct=False)
+            update_learning_history(
+                message.from_user.id, word_id, is_correct=False,
+            )
         hint = show_hint(
             "Допущена ошибка!",
             f"Попробуй ещё раз - 🇷🇺{translate_word}",

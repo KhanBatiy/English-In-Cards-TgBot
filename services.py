@@ -1,6 +1,11 @@
+import logging
+
 from default_db import Session
-from models import Word, User, UserWord, LearningHistory
+from models import Word, User, LearningHistory
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+
+logger = logging.getLogger(__name__)
 
 
 def new_user(message):
@@ -24,14 +29,31 @@ def new_user(message):
                 session.add(user)
                 try:
                     session.commit()
-                except Exception as e:
+                except IntegrityError as e:
                     session.rollback()
-                    print(f"Ошибка при создании пользователя: {e}")
+                    logger.warning(
+                        "Ошибка целостности при создании пользователя "
+                        "tg_id=%s: %s",
+                        tg_id, e,
+                    )
+                    return None
+                except SQLAlchemyError as e:
+                    session.rollback()
+                    logger.exception(
+                        "Ошибка БД при создании пользователя tg_id=%s: %s",
+                        tg_id, e,
+                    )
                     return None
 
             return user
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Ошибка БД в new_user (tg_id=%s): %s",
+            message.from_user.id, e,
+        )
+        return None
     except Exception as e:
-        print(f"Ошибка в new_user: {e}")
+        logger.exception("Неожиданная ошибка в new_user: %s", e)
         return None
 
 
@@ -41,20 +63,29 @@ def create_words(message):
     """
     try:
         with Session() as session:
-            user = session.query(User).filter_by(tg_id=message.from_user.id).first()
+            user = (
+                session.query(User)
+                .filter_by(tg_id=message.from_user.id)
+                .first()
+            )
             if not user:
                 print(f"Юзер {message.from_user.username} вне игры!")
                 return []
 
             # Получаем 4 случайных слова из базы данных
-            word_pairs = session.query(Word).order_by(func.random()).limit(4).all()
+            word_pairs = (
+                session.query(Word).order_by(func.random()).limit(4).all()
+            )
             if not word_pairs:
                 return []
 
             # Формируем список пар слов
-            pairs = [(w.original, w.translation, w.word_id) for w in word_pairs]
+            pairs = [
+                (w.original, w.translation, w.word_id) for w in word_pairs
+            ]
 
-            # Обновляем статистику пользователя по каждому слову
+            # Обновляем счётчик показов в LearningHistory
+            # для каждого показанного слова
             for _, _, word_id in pairs:
                 if not word_id:
                     continue
@@ -62,24 +93,33 @@ def create_words(message):
                 if not word:
                     continue
 
-                # Проверяем, есть ли уже запись о слове у пользователя
-                user_word = (
-                    session.query(UserWord)
+                history = (
+                    session.query(LearningHistory)
                     .filter_by(user_id=user.user_id, word_id=word_id)
                     .first()
                 )
-                if user_word:
-                    # Если есть, увеличиваем счетчик просмотров
-                    user_word.seen_count += 1
+                if history:
+                    history.seen_count += 1
                 else:
-                    # Если нет, создаем новую запись
                     session.add(
-                        UserWord(user_id=user.user_id, word_id=word_id, seen_count=1)
+                        LearningHistory(
+                            user_id=user.user_id,
+                            word_id=word_id,
+                            correct_count=0,
+                            fail_count=0,
+                            seen_count=1,
+                        )
                     )
             session.commit()
         return pairs
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Ошибка БД в create_words (tg_id=%s): %s",
+            message.from_user.id, e,
+        )
+        return []
     except Exception as e:
-        print(f"Ошибка в create_words: {e}")
+        logger.exception("Неожиданная ошибка в create_words: %s", e)
         return []
 
 
@@ -150,5 +190,10 @@ def update_learning_history(user_id, word_id, is_correct):
                 session.add(history)
 
             session.commit()
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Ошибка БД в update_learning_history (user_id=%s, word_id=%s): %s",
+            user_id, word_id, e,
+        )
     except Exception as e:
-        print(f"Ошибка в update_learning_history: {e}")
+        logger.exception("Неожиданная ошибка в update_learning_history: %s", e)
